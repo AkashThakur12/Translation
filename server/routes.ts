@@ -4,9 +4,12 @@ import multer from "multer";
 import { createWorker } from "tesseract.js";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import { Canvas, createCanvas, Image } from "canvas";
+import { Canvas, createCanvas, Image, registerFont } from "canvas";
 import fetch from "node-fetch";
 import sharp from "sharp";
+
+registerFont('/nix/store/s8il1dnfb61n7758qbipakk7nvyxydq7-noto-fonts-2025.04.01/share/fonts/noto/NotoSansBengali[wdth,wght].ttf', { family: 'Noto Sans Bengali' });
+console.log('Registered Noto Sans Bengali font for canvas rendering');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -123,6 +126,14 @@ async function extractTextFromPdfPage(
   const pdf = await loadingTask.promise;
   const page = await pdf.getPage(pageNumber + 1);
   
+  const textContent = await page.getTextContent();
+  const extractedText = textContent.items.map((item: any) => item.str || '').join(' ');
+  console.log(`Page ${pageNumber + 1} - PDF text layer: "${extractedText.substring(0, 200)}"`);
+  
+  if (extractedText && extractedText.length > 50) {
+    console.log(`Page ${pageNumber + 1} has ${extractedText.length} chars in text layer - using direct extraction`);
+  }
+  
   const targetDPI = 380;
   const baseDPI = 72;
   const scale = targetDPI / baseDPI;
@@ -146,28 +157,17 @@ async function extractTextFromPdfPage(
   
   console.log(`Page ${pageNumber + 1}: Rendered at ${Math.round(finalScale * baseDPI)} DPI (${finalViewport.width}x${finalViewport.height})`);
   
+  console.log(`Testing OCR with raw image first...`);
+  const rawResult = await worker.recognize(rawImageData);
+  console.log(`Page ${pageNumber + 1} (RAW): ${rawResult.data.text.length} chars, ${rawResult.data.confidence?.toFixed(1) || 0}% confidence`);
+  
   const results: Array<{ variant: string; result: any; confidence: number }> = [];
+  results.push({ variant: 'raw', result: rawResult, confidence: rawResult.data.confidence || 0 });
   
   for (const variant of ['grayscale', 'adaptive'] as const) {
     const processedImage = await preprocessImageForOCR(rawImageData, variant);
     
-    const result = await worker.recognize(processedImage, {
-      rotateAuto: true,
-    }, {
-      blocks: true,
-      text: true,
-      layoutBlocks: true,
-      hocr: false,
-      tsv: true,
-      box: false,
-      unlv: false,
-      osd: false,
-      pdf: false,
-      imageColor: false,
-      imageGrey: false,
-      imageBinary: false,
-      debug: false
-    });
+    const result = await worker.recognize(processedImage);
     
     const avgConfidence = result.data.confidence || 0;
     results.push({ variant, result, confidence: avgConfidence });
