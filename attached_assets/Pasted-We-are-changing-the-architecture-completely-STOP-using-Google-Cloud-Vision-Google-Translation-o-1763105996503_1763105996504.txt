@@ -1,0 +1,87 @@
+We are changing the architecture completely.  
+STOP using Google Cloud Vision, Google Translation, or Google Storage.  
+Remove ALL Google Cloud dependencies.
+
+Build a **100% free, unlimited Assamese → English PDF translator** using ONLY free open-source tools:
+
+----------------------------------
+### FREE-OCR REQUIREMENT
+Use **Tesseract.js** (Node version OR browser WASM version).  
+Load `asm` traineddata for Assamese OCR.
+
+OCR must:
+- read Assamese text from PDF (converted to images using pdf-lib or pdfjs)
+- handle scanned PDFs
+- return structured text (per page)
+
+----------------------------------
+### FREE TRANSLATION REQUIREMENT
+Do NOT use Google Translate API (paid).  
+Instead, use **HuggingFace free inference endpoints** (no API key needed) for translation:
+
+Primary model (best quality):
+- **IndicTrans2-en** → https://huggingface.co/ai4bharat/indictrans2-en
+
+Alternative models:
+- NLLB-600M
+- M2M100-1.2B
+
+Translation must:
+- accept extracted Assamese lines
+- batch them
+- translate to English
+- handle long texts
+
+Use fetch() to call:  
+https://api-inference.huggingface.co/models/ai4bharat/indictrans2-en  
+(No API key required.)
+
+----------------------------------
+### PDF REBUILD REQUIREMENT
+Use **PDF-lib** to:
+- import original PDF
+- overlay translated English text on each page
+- maintain page layout (top-left overlay is enough)
+- export a new PDF for download
+
+----------------------------------
+### FRONTEND REQUIREMENT
+Create a clean UI with:
+- PDF upload
+- “Translate to English” button
+- Progress logs
+- Download final PDF
+
+----------------------------------
+### BACKEND
+Use Node.js or a browser-only model:
+- If using Node backend → Tesseract.js Node API
+- If using browser → Tesseract.js WASM + pdf-lib client-side
+
+Pick whichever is easier for Replit.
+
+----------------------------------
+### WHAT TO BUILD
+Generate a full working Replit project:
+- index.html (upload form + UI)
+- script.js (handles OCR, translation, PDF generation)
+OR
+- Node backend (server.js) + frontend
+
+The entire solution must:
+- run FREE
+- not require external billing
+- not require API keys
+- not use any Google service
+- run fully inside Replit environment
+
+----------------------------------
+### FINAL OUTPUT
+I want a working app where:
+1. I upload Assamese PDF  
+2. It OCRs using Tesseract  
+3. Translates using HuggingFace IndicTrans2  
+4. Rebuilds the PDF  
+5. Lets me download English PDF  
+
+Make everything production-ready and runnable on Replit.

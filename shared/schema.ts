@@ -1,18 +1,24 @@
-import { sql } from "drizzle-orm";
-import { pgTable, text, varchar } from "drizzle-orm/pg-core";
-import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
-export const users = pgTable("users", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
-  username: text("username").notNull().unique(),
-  password: text("password").notNull(),
+export const translationJobSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  status: z.enum(['uploading', 'extracting', 'translating', 'generating', 'completed', 'error']),
+  progress: z.number().min(0).max(100),
+  currentStep: z.string().optional(),
+  errorMessage: z.string().optional(),
+  originalPages: z.number().optional(),
+  translatedPages: z.number().optional(),
+  createdAt: z.string(),
 });
 
-export const insertUserSchema = createInsertSchema(users).pick({
-  username: true,
-  password: true,
+export type TranslationJob = z.infer<typeof translationJobSchema>;
+
+export const uploadPdfSchema = z.object({
+  file: z.instanceof(File).refine(
+    (file) => file.type === 'application/pdf',
+    'File must be a PDF'
+  ),
 });
 
-export type InsertUser = z.infer<typeof insertUserSchema>;
-export type User = typeof users.$inferSelect;
+export type UploadPdf = z.infer<typeof uploadPdfSchema>;
