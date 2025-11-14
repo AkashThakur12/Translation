@@ -1,0 +1,397 @@
+Files you must create (Option 1: Replit) — EXACT file names & copy/paste contents
+
+Open your new Repl (Node.js). In the left file panel create these files exactly with the contents below.
+
+1) package.json
+
+Create file package.json and paste:
+
+{
+  "name": "assamese-translator-replit",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google-cloud/storage": "^6.11.0",
+    "@google-cloud/vision": "^3.4.0",
+    "@google-cloud/translate": "^6.3.2",
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "pdf-lib": "^1.20.0",
+    "node-fetch": "^2.6.7",
+    "uuid": "^9.0.0"
+  }
+}
+
+2) index.html
+
+Create file index.html and paste:
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Assamese → English Translator (Replit)</title>
+</head>
+<body style="font-family:Arial,Helvetica,sans-serif;padding:20px">
+  <h2>Assamese → English (Vision + Translate)</h2>
+  <input id="file" type="file" accept="application/pdf"/><br/><br/>
+  <button id="go">Upload & Translate</button>
+  <div id="status" style="margin-top:12px"></div>
+  <script>
+    const fileEl = document.getElementById('file');
+    const btn = document.getElementById('go');
+    const status = document.getElementById('status');
+
+    btn.onclick = async () => {
+      if(!fileEl.files || !fileEl.files[0]) { alert('Select a PDF'); return; }
+      const fd = new FormData();
+      fd.append('file', fileEl.files[0]);
+      status.innerText = 'Uploading...';
+      try {
+        const res = await fetch('/translate_pdf', { method: 'POST', body: fd });
+        if(!res.ok) {
+          const txt = await res.text();
+          status.innerText = 'Error: ' + txt;
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'translated_en.pdf';
+        a.click();
+        status.innerText = 'Done — PDF downloaded.';
+      } catch(e) {
+        status.innerText = 'Error: ' + e.message;
+      }
+    };
+  </script>
+</body>
+</html>
+
+3) server.js
+
+Create file server.js and paste the full server code (this is the exact server we prepared earlier). Copy the whole block below:
+
+// server.js
+const express = require('express');
+const multer = require('multer');
+const fs = require('fs');
+const { Storage } = require('@google-cloud/storage');
+const vision = require('@google-cloud/vision');
+const { TranslationServiceClient } = require('@google-cloud/translate').v3;
+const { PDFDocument, rgb, StandardFonts } = require('pdf-lib');
+const { v4: uuidv4 } = require('uuid');
+const path = require('path');
+
+const app = express();
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Read env secrets (written into /tmp/key.json)
+const googleServiceAccountJson = process.env.GOOGLE_SERVICE_ACCOUNT;
+const GCP_PROJECT_ID = process.env.GCP_PROJECT_ID;
+const GCS_BUCKET = process.env.GCS_BUCKET;
+
+if(!googleServiceAccountJson || !GCP_PROJECT_ID || !GCS_BUCKET){
+  console.error("Missing env vars. Set GOOGLE_SERVICE_ACCOUNT, GCP_PROJECT_ID, GCS_BUCKET in Replit Secrets.");
+}
+
+// Write SA key into /tmp/gc-key.json
+const KEY_FILE = '/tmp/gc-key.json';
+if (googleServiceAccountJson) {
+  try {
+    fs.writeFileSync(KEY_FILE, googleServiceAccountJson, 'utf8');
+    process.env.GOOGLE_APPLICATION_CREDENTIALS = KEY_FILE;
+  } catch (e) {
+    console.error('Failed to write key file:', e);
+  }
+}
+
+// Initialize GCP clients
+const storage = new Storage({ projectId: GCP_PROJECT_ID });
+const visionClient = new vision.v1.ImageAnnotatorClient();
+const translateClient = new TranslationServiceClient();
+
+// Upload buffer → GCS path
+async function uploadBufferToGCS(buffer, filename) {
+  const bucket = storage.bucket(GCS_BUCKET);
+  const file = bucket.file(filename);
+  await file.save(buffer, { resumable: false });
+  return `gs://${GCS_BUCKET}/${filename}`;
+}
+
+// Run Vision asyncBatchAnnotateFiles
+async function runVisionAsyncGCS(gcsInputUri, gcsOutputPrefix) {
+  const request = {
+    requests: [
+      {
+        inputConfig: {
+          gcsSource: { uri: gcsInputUri },
+          mimeType: 'application/pdf'
+        },
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION' }],
+        outputConfig: {
+          gcsDestination: { uri: gcsOutputPrefix },
+          batchSize: 2
+        }
+      }
+    ]
+  };
+  const [operation] = await visionClient.asyncBatchAnnotateFiles(request);
+  const [response] = await operation.promise();
+  return response;
+}
+
+// Download all Vision output JSON files
+async function downloadVisionOutputPrefix(prefixUri) {
+  const match = prefixUri.match(/^gs:\/\/([^\/]+)\/(.+)$/);
+  if(!match) throw new Error("Invalid GCS prefix: " + prefixUri);
+  const bucketName = match[1];
+  const prefix = match[2];
+
+  const bucket = storage.bucket(bucketName);
+  const [files] = await bucket.getFiles({ prefix });
+
+  const results = [];
+  for (const f of files) {
+    if (f.name.endsWith('.json')) {
+      const buf = await f.download();
+      results.push(JSON.parse(buf.toString('utf8')));
+    }
+  }
+  return results;
+}
+
+// Extract plain text per page
+function parseVisionJsonToPages(visionJsons) {
+  const pages = [];
+
+  for (const doc of visionJsons) {
+    if (!doc.responses) continue;
+
+    for (const r of doc.responses) {
+      const fta = r.fullTextAnnotation;
+
+      if (!fta) {
+        pages.push('');
+        continue;
+      }
+
+      for (const page of fta.pages) {
+        let pageText = '';
+
+        for (const block of page.blocks || []) {
+          for (const para of block.paragraphs || []) {
+            const paraText = (para.words || [])
+              .map(w => (w.symbols || []).map(s => s.text).join(''))
+              .join(' ');
+            pageText += paraText + '\n';
+          }
+        }
+
+        if (!pageText && fta.text) {
+          pageText = fta.text;
+        }
+
+        pages.push(pageText);
+      }
+    }
+  }
+
+  return pages;
+}
+
+// Translate array of strings
+async function translateTexts(texts, target='en') {
+  const parent = `projects/${GCP_PROJECT_ID}/locations/global`;
+
+  const [response] = await translateClient.translateText({
+    parent,
+    contents: texts,
+    mimeType: 'text/plain',
+    targetLanguageCode: target
+  });
+
+  return (response.translations || []).map(t => t.translatedText || '');
+}
+
+// Overlay translated text on the original PDF
+async function overlayTranslationsOnPdf(originalPdfBytes, translationsPerPage) {
+  const srcDoc = await PDFDocument.load(originalPdfBytes);
+  const out = await PDFDocument.create();
+  const helv = await out.embedFont(StandardFonts.Helvetica);
+
+  for (let i = 0; i < srcDoc.getPageCount(); i++) {
+    const [copied] = await out.copyPages(srcDoc, [i]);
+    out.addPage(copied);
+
+    const page = out.getPage(i);
+    const { width, height } = page.getSize();
+
+    const text = translationsPerPage[i] || '';
+    const fontSize = 10;
+    const margin = 30;
+    const maxWidth = width - margin * 2;
+
+    let y = height - margin;
+    let line = '';
+
+    const words = text.split(/\s+/);
+    for (const w of words) {
+      const test = line ? line + ' ' + w : w;
+      const tw = helv.widthOfTextAtSize(test, fontSize);
+
+      if (tw <= maxWidth) {
+        line = test;
+      } else {
+        page.drawText(line, { x: margin, y, size: fontSize, font: helv, color: rgb(0,0,0) });
+        y -= fontSize * 1.2;
+        line = w;
+
+        if (y < margin) break;
+      }
+    }
+
+    if (line && y >= margin) {
+      page.drawText(line, { x: margin, y, size: fontSize, font: helv, color: rgb(0,0,0) });
+    }
+  }
+
+  return await out.save();
+}
+
+// Serve index.html
+app.get('/', (req,res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+// Upload + Translate
+app.post('/translate_pdf', upload.single('file'), async (req,res) => {
+  try {
+    if(!req.file) return res.status(400).json({ error: "no file uploaded" });
+
+    const filename = `uploads/${Date.now()}-${uuidv4()}.pdf`;
+    const gcsUri = await uploadBufferToGCS(req.file.buffer, filename);
+
+    const outPrefix = `gs://${GCS_BUCKET}/vision-out-${Date.now()}-${uuidv4()}/`;
+
+    await runVisionAsyncGCS(gcsUri, outPrefix);
+
+    const visionJsons = await downloadVisionOutputPrefix(outPrefix);
+    const pages = parseVisionJsonToPages(visionJsons);
+
+    const translations = await translateTexts(pages, 'en');
+
+    const translatedPdf = await overlayTranslationsOnPdf(req.file.buffer, translations);
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", "attachment; filename=translated_en.pdf");
+    res.send(Buffer.from(translatedPdf));
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("Server running on " + port));
+
+4) .replit
+
+Create file .replit and paste:
+
+run = "node server.js"
+
+5) .gitignore
+
+Create file .gitignore and paste:
+
+node_modules/
+.env
+/tmp/
+uploads/
+
+After you paste all files into Replit — do this (the single manual step)
+
+In Replit left-panel click the lock icon (Secrets / Environment variables).
+
+Add these three secrets (exact names):
+
+GOOGLE_SERVICE_ACCOUNT → value = paste the entire contents of your Google Service Account JSON file (the one you created & downloaded from Google Cloud). Paste raw JSON into the value field (Replit will store it securely).
+
+GCP_PROJECT_ID → value = your Google Cloud project id (string).
+
+GCS_BUCKET → value = the name of the Cloud Storage bucket you created in the Google Console.
+
+If you don’t yet have these, follow the brief guide below to create them in Google Cloud — I’ll paste exact click-by-click steps for that after this section.
+
+Click Run in Replit. Wait for the console to install dependencies and start. Replit will show a public URL link (top-right). Open it.
+
+In the web UI, choose your PDF, click Upload & Translate. When processing completes the browser will download translated_en.pdf.
+
+How to create the Google Cloud items (very short, copy-paste steps)
+
+If you don’t already have a project, service account and bucket, here are exact Console steps — this is the only part that touches billing/APIs.
+
+Create project & enable APIs (console)
+
+Go to https://console.cloud.google.com/
+ and create/select a project. Note Project ID.
+
+In APIs & Services → Library enable:
+
+Cloud Vision API
+
+Cloud Translation API (Advanced)
+
+Cloud Storage
+
+Create a bucket: Storage → Browser → Create bucket → choose a unique name (remember it) and default options.
+
+Create service account & key (console)
+
+IAM & Admin → Service Accounts → Create Service Account
+
+Name it replit-translator-sa (or any name). Click Create.
+
+Grant roles:
+
+Vision API User
+
+Cloud Translation API User
+
+Storage Admin (or Storage Object Admin)
+
+Create key: After creating, click the account → Keys → Add Key → Create new key → JSON → download key.json.
+
+Finally, copy the entire key.json file content and paste it into Replit secret GOOGLE_SERVICE_ACCOUNT.
+
+Troubleshooting / typical errors & fixes
+
+Dependencies failing to install: open Replit console, copy the error and paste here — I’ll fix versions.
+
+500 error after upload: check Replit console logs — usually missing secrets or permission on bucket.
+
+Vision returns no text: try increasing page DPI or ask me to update server.js to use bounding boxes; I can patch it.
+
+Want me to do any of these steps for you?
+
+I can’t operate your Replit or Google Console for you, but I will do this immediately in the chat if you want:
+
+Paste server.js again into the chat in case you need it (I already gave it above).
+
+Provide a ZIP you can download (I can prepare the ZIP contents as a download link if you want).
+
+Or produce a step-by-step screenshot-style micro-guide for the Google Console actions.
+
+Which of the three follow-ups do you want now?
+
+ZIP please (I’ll provide a downloadable ZIP of the project files you can upload directly to Replit or GitHub).
+
+Google Console step-by-step (I’ll paste exact clicks + screenshots-style text).
+
+Start troubleshooting (you will create Replit and paste secrets; then paste the Replit public URL here and I’ll debug).
