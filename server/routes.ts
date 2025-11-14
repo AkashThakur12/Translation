@@ -4,8 +4,9 @@ import multer from "multer";
 import { createWorker } from "tesseract.js";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import { Canvas } from "canvas";
+import { Canvas, createCanvas, Image } from "canvas";
 import fetch from "node-fetch";
+import sharp from "sharp";
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -14,6 +15,58 @@ interface TranslationRequest {
   parameters?: {
     src_lang?: string;
     tgt_lang?: string;
+  };
+}
+
+async function preprocessImageForOCR(imageBuffer: Buffer, variant: 'grayscale' | 'adaptive'): Promise<Buffer> {
+  try {
+    if (variant === 'grayscale') {
+      return await sharp(imageBuffer)
+        .greyscale()
+        .gamma(1.8)
+        .normalize()
+        .median(3)
+        .sharpen({ sigma: 0.8 })
+        .png()
+        .toBuffer();
+    } else {
+      return await sharp(imageBuffer)
+        .greyscale()
+        .normalize()
+        .clahe({ width: 32, height: 32, maxSlope: 3 })
+        .sharpen({ sigma: 0.5 })
+        .png()
+        .toBuffer();
+    }
+  } catch (error) {
+    console.error('Image preprocessing error:', error);
+    return imageBuffer;
+  }
+}
+
+interface OCRWord {
+  text: string;
+  confidence: number;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+}
+
+interface OCRLine {
+  text: string;
+  confidence: number;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  words: OCRWord[];
+}
+
+interface OCRResult {
+  text: string;
+  confidence: number;
+  lines: OCRLine[];
+  pageMetrics: {
+    viewportWidth: number;
+    viewportHeight: number;
+    pdfWidth: number;
+    pdfHeight: number;
+    scale: number;
   };
 }
 
@@ -63,7 +116,7 @@ async function extractTextFromPdfPage(
   pdfBuffer: Buffer,
   pageNumber: number,
   worker: any
-): Promise<string> {
+): Promise<OCRResult> {
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(pdfBuffer),
     useSystemFonts: true,
@@ -73,27 +126,130 @@ async function extractTextFromPdfPage(
   const pdf = await loadingTask.promise;
   const page = await pdf.getPage(pageNumber + 1);
   
-  const viewport = page.getViewport({ scale: 3.0 });
-  const canvas = new Canvas(viewport.width, viewport.height);
+  const targetDPI = 380;
+  const baseDPI = 72;
+  const scale = targetDPI / baseDPI;
+  
+  const viewport = page.getViewport({ scale });
+  const maxImageSize = 25000000;
+  const actualSize = viewport.width * viewport.height;
+  const finalScale = actualSize > maxImageSize ? scale * Math.sqrt(maxImageSize / actualSize) : scale;
+  const finalViewport = page.getViewport({ scale: finalScale });
+  
+  const canvas = new Canvas(finalViewport.width, finalViewport.height);
   const context = canvas.getContext("2d");
 
   await page.render({
     canvasContext: context as any,
-    viewport: viewport,
+    viewport: finalViewport,
     canvas: canvas as any,
   } as any).promise;
 
-  const imageData = canvas.toBuffer("image/png");
+  const rawImageData = canvas.toBuffer("image/png");
   
-  console.log(`Page ${pageNumber + 1}: Rendered to ${viewport.width}x${viewport.height}, image size: ${imageData.length} bytes`);
+  console.log(`Page ${pageNumber + 1}: Rendered at ${Math.round(finalScale * baseDPI)} DPI (${finalViewport.width}x${finalViewport.height})`);
   
-  const { data: { text, confidence } } = await worker.recognize(imageData, {
-    rotateAuto: true,
-  });
+  const results: Array<{ variant: string; result: any; confidence: number }> = [];
   
-  console.log(`Page ${pageNumber + 1}: Extracted ${text.length} chars with ${confidence}% confidence`);
+  for (const variant of ['grayscale', 'adaptive'] as const) {
+    const processedImage = await preprocessImageForOCR(rawImageData, variant);
+    
+    const result = await worker.recognize(processedImage, {
+      rotateAuto: true,
+    }, {
+      blocks: true,
+      text: true,
+      layoutBlocks: true,
+      hocr: false,
+      tsv: true,
+      box: false,
+      unlv: false,
+      osd: false,
+      pdf: false,
+      imageColor: false,
+      imageGrey: false,
+      imageBinary: false,
+      debug: false
+    });
+    
+    const avgConfidence = result.data.confidence || 0;
+    results.push({ variant, result, confidence: avgConfidence });
+    
+    console.log(`Page ${pageNumber + 1} (${variant}): ${result.data.text.length} chars, ${avgConfidence.toFixed(1)}% confidence`);
+  }
   
-  return text.trim();
+  results.sort((a, b) => b.confidence - a.confidence);
+  const bestResult = results[0].result;
+  
+  console.log(`Page ${pageNumber + 1}: Selected ${results[0].variant} variant (${results[0].confidence.toFixed(1)}% confidence)`);
+  
+  const words: OCRWord[] = bestResult.data.words?.map((w: any) => ({
+    text: w.text || '',
+    confidence: w.confidence || 0,
+    bbox: {
+      x0: w.bbox?.x0 || 0,
+      y0: w.bbox?.y0 || 0,
+      x1: w.bbox?.x1 || 0,
+      y1: w.bbox?.y1 || 0
+    }
+  })) || [];
+  
+  const lines: OCRLine[] = [];
+  if (words.length > 0) {
+    const sortedWords = [...words].sort((a, b) => a.bbox.y0 - b.bbox.y0);
+    let currentLine: OCRWord[] = [sortedWords[0]];
+    
+    for (let i = 1; i < sortedWords.length; i++) {
+      const word = sortedWords[i];
+      const prevWord = sortedWords[i - 1];
+      const yTolerance = 4;
+      
+      if (Math.abs(word.bbox.y0 - prevWord.bbox.y0) < yTolerance) {
+        currentLine.push(word);
+      } else {
+        if (currentLine.length > 0) {
+          const lineText = currentLine.map(w => w.text).join(' ');
+          const lineConfidence = currentLine.reduce((sum, w) => sum + w.confidence, 0) / currentLine.length;
+          const lineBbox = {
+            x0: Math.min(...currentLine.map(w => w.bbox.x0)),
+            y0: Math.min(...currentLine.map(w => w.bbox.y0)),
+            x1: Math.max(...currentLine.map(w => w.bbox.x1)),
+            y1: Math.max(...currentLine.map(w => w.bbox.y1))
+          };
+          lines.push({ text: lineText, confidence: lineConfidence, bbox: lineBbox, words: currentLine });
+        }
+        currentLine = [word];
+      }
+    }
+    
+    if (currentLine.length > 0) {
+      const lineText = currentLine.map(w => w.text).join(' ');
+      const lineConfidence = currentLine.reduce((sum, w) => sum + w.confidence, 0) / currentLine.length;
+      const lineBbox = {
+        x0: Math.min(...currentLine.map(w => w.bbox.x0)),
+        y0: Math.min(...currentLine.map(w => w.bbox.y0)),
+        x1: Math.max(...currentLine.map(w => w.bbox.x1)),
+        y1: Math.max(...currentLine.map(w => w.bbox.y1))
+      };
+      lines.push({ text: lineText, confidence: lineConfidence, bbox: lineBbox, words: currentLine });
+    }
+  }
+  
+  const originalPage = await pdf.getPage(pageNumber + 1);
+  const originalViewport = originalPage.getViewport({ scale: 1.0 });
+  
+  return {
+    text: bestResult.data.text.trim(),
+    confidence: results[0].confidence,
+    lines,
+    pageMetrics: {
+      viewportWidth: finalViewport.width,
+      viewportHeight: finalViewport.height,
+      pdfWidth: originalViewport.width,
+      pdfHeight: originalViewport.height,
+      scale: finalScale
+    }
+  };
 }
 
 async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer; extractedTexts: string[]; translatedTexts: string[] }> {
@@ -107,7 +263,7 @@ async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer;
   
   console.log(`Processing PDF with ${numPages} pages`);
   
-  console.log('Initializing Tesseract worker for Assamese...');
+  console.log('Initializing Tesseract worker for Assamese with Indic-optimized parameters...');
   const worker = await createWorker('asm', 1, {
     logger: (m) => {
       if (m.status === 'recognizing text') {
@@ -116,21 +272,32 @@ async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer;
     }
   });
   
+  await worker.setParameters({
+    tessedit_char_blacklist: '',
+    lstm_choice_mode: '2',
+    preserve_interword_spaces: '1',
+    tessedit_write_images: '0'
+  });
+  console.log('Tesseract configured for Assamese script optimization');
+  
+  const ocrResults: OCRResult[] = [];
   const extractedTexts: string[] = [];
   const translatedTexts: string[] = [];
   
   try {
     for (let i = 0; i < numPages; i++) {
       console.log(`Extracting text from page ${i + 1}/${numPages}`);
-      const text = await extractTextFromPdfPage(pdfBuffer, i, worker);
-      extractedTexts.push(text);
+      const ocrResult = await extractTextFromPdfPage(pdfBuffer, i, worker);
+      ocrResults.push(ocrResult);
+      extractedTexts.push(ocrResult.text);
       
-      if (text && text.length > 10) {
-        console.log(`Translating page ${i + 1}/${numPages} (${text.length} characters)`);
-        console.log(`First 100 chars: ${text.substring(0, 100)}`);
+      if (ocrResult.text && ocrResult.text.length > 10) {
+        console.log(`Page ${i + 1}: ${ocrResult.lines.length} lines, ${ocrResult.text.length} chars, ${ocrResult.confidence.toFixed(1)}% confidence`);
+        console.log(`First 100 chars: ${ocrResult.text.substring(0, 100)}`);
         
         try {
-          const translated = await translateWithHuggingFace(text);
+          const linesText = ocrResult.lines.map(line => line.text).join('\n');
+          const translated = await translateWithHuggingFace(linesText);
           console.log(`Translation result: ${translated.substring(0, 100)}`);
           translatedTexts.push(translated);
         } catch (error) {
@@ -138,7 +305,7 @@ async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer;
           translatedTexts.push(`[Translation failed: ${error}]`);
         }
       } else {
-        console.log(`Page ${i + 1} has insufficient text (${text.length} chars)`);
+        console.log(`Page ${i + 1} has insufficient text (${ocrResult.text.length} chars)`);
         translatedTexts.push("");
       }
     }
