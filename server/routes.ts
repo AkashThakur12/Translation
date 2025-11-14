@@ -61,7 +61,8 @@ async function translateWithHuggingFace(text: string): Promise<string> {
 
 async function extractTextFromPdfPage(
   pdfBuffer: Buffer,
-  pageNumber: number
+  pageNumber: number,
+  worker: any
 ): Promise<string> {
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(pdfBuffer),
@@ -72,7 +73,7 @@ async function extractTextFromPdfPage(
   const pdf = await loadingTask.promise;
   const page = await pdf.getPage(pageNumber + 1);
   
-  const viewport = page.getViewport({ scale: 2.0 });
+  const viewport = page.getViewport({ scale: 3.0 });
   const canvas = new Canvas(viewport.width, viewport.height);
   const context = canvas.getContext("2d");
 
@@ -84,15 +85,18 @@ async function extractTextFromPdfPage(
 
   const imageData = canvas.toBuffer("image/png");
   
-  const worker = await createWorker("asm");
+  console.log(`Page ${pageNumber + 1}: Rendered to ${viewport.width}x${viewport.height}, image size: ${imageData.length} bytes`);
   
-  const { data: { text } } = await worker.recognize(imageData);
-  await worker.terminate();
+  const { data: { text, confidence } } = await worker.recognize(imageData, {
+    rotateAuto: true,
+  });
+  
+  console.log(`Page ${pageNumber + 1}: Extracted ${text.length} chars with ${confidence}% confidence`);
   
   return text.trim();
 }
 
-async function translatePdf(pdfBuffer: Buffer): Promise<Buffer> {
+async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer; extractedTexts: string[]; translatedTexts: string[] }> {
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(pdfBuffer),
     useSystemFonts: true,
@@ -103,20 +107,44 @@ async function translatePdf(pdfBuffer: Buffer): Promise<Buffer> {
   
   console.log(`Processing PDF with ${numPages} pages`);
   
+  console.log('Initializing Tesseract worker for Assamese...');
+  const worker = await createWorker('asm', 1, {
+    logger: (m) => {
+      if (m.status === 'recognizing text') {
+        console.log(`OCR progress: ${Math.round(m.progress * 100)}%`);
+      }
+    }
+  });
+  
+  const extractedTexts: string[] = [];
   const translatedTexts: string[] = [];
   
-  for (let i = 0; i < numPages; i++) {
-    console.log(`Extracting text from page ${i + 1}/${numPages}`);
-    const text = await extractTextFromPdfPage(pdfBuffer, i);
-    
-    if (text && text.length > 0) {
-      console.log(`Translating page ${i + 1}/${numPages}`);
-      const translated = await translateWithHuggingFace(text);
-      translatedTexts.push(translated);
-    } else {
-      console.log(`Page ${i + 1} has no text`);
-      translatedTexts.push("");
+  try {
+    for (let i = 0; i < numPages; i++) {
+      console.log(`Extracting text from page ${i + 1}/${numPages}`);
+      const text = await extractTextFromPdfPage(pdfBuffer, i, worker);
+      extractedTexts.push(text);
+      
+      if (text && text.length > 10) {
+        console.log(`Translating page ${i + 1}/${numPages} (${text.length} characters)`);
+        console.log(`First 100 chars: ${text.substring(0, 100)}`);
+        
+        try {
+          const translated = await translateWithHuggingFace(text);
+          console.log(`Translation result: ${translated.substring(0, 100)}`);
+          translatedTexts.push(translated);
+        } catch (error) {
+          console.error(`Translation failed for page ${i + 1}:`, error);
+          translatedTexts.push(`[Translation failed: ${error}]`);
+        }
+      } else {
+        console.log(`Page ${i + 1} has insufficient text (${text.length} chars)`);
+        translatedTexts.push("");
+      }
     }
+  } finally {
+    await worker.terminate();
+    console.log('Tesseract worker terminated');
   }
   
   const originalPdfDoc = await PDFDocument.load(pdfBuffer);
@@ -135,51 +163,66 @@ async function translatePdf(pdfBuffer: Buffer): Promise<Buffer> {
     const translatedText = translatedTexts[index] || "";
     if (!translatedText) return;
     
-    const fontSize = 10;
-    const margin = 30;
+    const fontSize = 9;
+    const margin = 25;
+    const lineHeight = fontSize * 1.3;
     const maxWidth = width - margin * 2;
     let y = height - margin;
     
-    const words = translatedText.split(/\s+/);
-    let line = "";
+    const paragraphs = translatedText.split(/\n\n+/);
     
-    for (const word of words) {
-      const testLine = line ? `${line} ${word}` : word;
-      const textWidth = font.widthOfTextAtSize(testLine, fontSize);
+    for (const paragraph of paragraphs) {
+      const words = paragraph.split(/\s+/).filter(w => w.length > 0);
+      let line = "";
       
-      if (textWidth <= maxWidth) {
-        line = testLine;
-      } else {
-        if (line) {
-          page.drawText(line, {
-            x: margin,
-            y,
-            size: fontSize,
-            font,
-            color: rgb(0, 0, 0),
-          });
-          y -= fontSize * 1.4;
-        }
-        line = word;
+      for (const word of words) {
+        const testLine = line ? `${line} ${word}` : word;
+        const textWidth = font.widthOfTextAtSize(testLine, fontSize);
         
-        if (y < margin) break;
+        if (textWidth <= maxWidth) {
+          line = testLine;
+        } else {
+          if (line) {
+            page.drawText(line, {
+              x: margin,
+              y,
+              size: fontSize,
+              font,
+              color: rgb(0, 0, 0.8),
+            });
+            y -= lineHeight;
+          }
+          line = word;
+          
+          if (y < margin + lineHeight) break;
+        }
       }
-    }
-    
-    if (line && y >= margin) {
-      page.drawText(line, {
-        x: margin,
-        y,
-        size: fontSize,
-        font,
-        color: rgb(0, 0, 0),
-      });
+      
+      if (line && y >= margin) {
+        page.drawText(line, {
+          x: margin,
+          y,
+          size: fontSize,
+          font,
+          color: rgb(0, 0, 0.8),
+        });
+        y -= lineHeight;
+      }
+      
+      y -= lineHeight * 0.5;
+      if (y < margin) break;
     }
   });
   
   const translatedPdfBytes = await pdfDoc.save();
-  return Buffer.from(translatedPdfBytes);
+  return {
+    translatedPdf: Buffer.from(translatedPdfBytes),
+    extractedTexts,
+    translatedTexts,
+  };
 }
+
+const translationCache = new Map<string, { translatedPdf: Buffer; extractedTexts: string[]; translatedTexts: string[]; timestamp: number }>();
 
 export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/translate", upload.single("file"), async (req, res) => {
@@ -192,19 +235,47 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "File must be a PDF" });
       }
 
-      console.log("Starting translation process...");
-      const translatedPdf = await translatePdf(req.file.buffer);
+      console.log(`Starting translation process for ${req.file.originalname}...`);
+      const result = await translatePdf(req.file.buffer);
       
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="translated_${req.file.originalname}"`
-      );
-      res.send(translatedPdf);
+      const jobId = Date.now().toString() + Math.random().toString(36).substring(7);
+      translationCache.set(jobId, { ...result, timestamp: Date.now() });
+      
+      setTimeout(() => translationCache.delete(jobId), 30 * 60 * 1000);
+      
+      res.json({
+        jobId,
+        filename: req.file.originalname,
+        pages: result.extractedTexts.length,
+        extractedTexts: result.extractedTexts,
+        translatedTexts: result.translatedTexts,
+      });
     } catch (error) {
       console.error("Translation error:", error);
       res.status(500).json({
         error: error instanceof Error ? error.message : "Translation failed",
+      });
+    }
+  });
+
+  app.get("/api/download/:jobId", async (req, res) => {
+    try {
+      const cached = translationCache.get(req.params.jobId);
+      
+      if (!cached) {
+        return res.status(404).json({ error: "Translation job not found or expired" });
+      }
+      
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="translated_english.pdf"`
+      );
+      res.send(cached.translatedPdf);
+    } catch (error) {
+      console.error("Download error:", error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : "Download failed",
       });
     }
   });
