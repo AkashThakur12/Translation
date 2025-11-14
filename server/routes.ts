@@ -47,9 +47,9 @@ async function translateWithHuggingFace(text: string): Promise<string> {
 
   const result = await response.json();
   
-  if (Array.isArray(result) && result.length > 0 && result[0].translation_text) {
+  if (Array.isArray(result) && result.length > 0 && result[0]?.translation_text) {
     return result[0].translation_text;
-  } else if (typeof result === 'object' && result.generated_text) {
+  } else if (result && typeof result === 'object' && 'generated_text' in result && typeof result.generated_text === 'string') {
     return result.generated_text;
   } else if (typeof result === 'string') {
     return result;
@@ -79,7 +79,8 @@ async function extractTextFromPdfPage(
   await page.render({
     canvasContext: context as any,
     viewport: viewport,
-  }).promise;
+    canvas: canvas as any,
+  } as any).promise;
 
   const imageData = canvas.toBuffer("image/png");
   
