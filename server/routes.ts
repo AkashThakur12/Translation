@@ -23,18 +23,15 @@ async function preprocessImageForOCR(imageBuffer: Buffer, variant: 'grayscale' |
     if (variant === 'grayscale') {
       return await sharp(imageBuffer)
         .greyscale()
-        .gamma(1.8)
         .normalize()
-        .median(3)
-        .sharpen({ sigma: 0.8 })
+        .sharpen({ sigma: 0.5 })
         .png()
         .toBuffer();
     } else {
       return await sharp(imageBuffer)
         .greyscale()
         .normalize()
-        .clahe({ width: 32, height: 32, maxSlope: 3 })
-        .sharpen({ sigma: 0.5 })
+        .linear(1.1, -(128 * 0.1))
         .png()
         .toBuffer();
     }
@@ -263,12 +260,10 @@ async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer;
   
   console.log(`Processing PDF with ${numPages} pages`);
   
-  console.log('Initializing Tesseract worker for Assamese with Indic-optimized parameters...');
-  const worker = await createWorker('asm', 1, {
+  console.log('Initializing Tesseract worker for Bengali/Assamese script...');
+  const worker = await createWorker('ben', 1, {
     logger: (m) => {
-      if (m.status === 'recognizing text') {
-        console.log(`OCR progress: ${Math.round(m.progress * 100)}%`);
-      }
+      console.log(`Tesseract: ${m.status} - ${m.progress ? Math.round(m.progress * 100) + '%' : ''}`);
     }
   });
   
