@@ -1,72 +1,21 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import multer from "multer";
-import { createWorker } from "tesseract.js";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import { Canvas, createCanvas, Image, registerFont } from "canvas";
 import fetch from "node-fetch";
-import sharp from "sharp";
-
-registerFont('/nix/store/s8il1dnfb61n7758qbipakk7nvyxydq7-noto-fonts-2025.04.01/share/fonts/noto/NotoSansBengali[wdth,wght].ttf', { family: 'Noto Sans Bengali' });
-console.log('Registered Noto Sans Bengali font for canvas rendering');
+import { Mistral } from "@mistralai/mistralai";
 
 const upload = multer({ storage: multer.memoryStorage() });
+
+const mistralClient = new Mistral({
+  apiKey: process.env.MISTRAL_API_KEY || "",
+});
 
 interface TranslationRequest {
   inputs: string;
   parameters?: {
     src_lang?: string;
     tgt_lang?: string;
-  };
-}
-
-async function preprocessImageForOCR(imageBuffer: Buffer, variant: 'grayscale' | 'adaptive'): Promise<Buffer> {
-  try {
-    if (variant === 'grayscale') {
-      return await sharp(imageBuffer)
-        .greyscale()
-        .normalize()
-        .sharpen({ sigma: 0.5 })
-        .png()
-        .toBuffer();
-    } else {
-      return await sharp(imageBuffer)
-        .greyscale()
-        .normalize()
-        .linear(1.1, -(128 * 0.1))
-        .png()
-        .toBuffer();
-    }
-  } catch (error) {
-    console.error('Image preprocessing error:', error);
-    return imageBuffer;
-  }
-}
-
-interface OCRWord {
-  text: string;
-  confidence: number;
-  bbox: { x0: number; y0: number; x1: number; y1: number };
-}
-
-interface OCRLine {
-  text: string;
-  confidence: number;
-  bbox: { x0: number; y0: number; x1: number; y1: number };
-  words: OCRWord[];
-}
-
-interface OCRResult {
-  text: string;
-  confidence: number;
-  lines: OCRLine[];
-  pageMetrics: {
-    viewportWidth: number;
-    viewportHeight: number;
-    pdfWidth: number;
-    pdfHeight: number;
-    scale: number;
   };
 }
 
@@ -112,201 +61,86 @@ async function translateWithHuggingFace(text: string): Promise<string> {
   throw new Error("Invalid translation response format");
 }
 
-async function extractTextFromPdfPage(
-  pdfBuffer: Buffer,
-  pageNumber: number,
-  worker: any
-): Promise<OCRResult> {
-  const loadingTask = pdfjsLib.getDocument({
-    data: new Uint8Array(pdfBuffer),
-    useSystemFonts: true,
-    standardFontDataUrl: "node_modules/pdfjs-dist/standard_fonts/",
-  });
+async function extractTextWithMistralOCR(pdfBuffer: Buffer): Promise<{
+  pages: Array<{ markdown: string; pageNumber: number }>;
+  totalPages: number;
+}> {
+  console.log('Starting Mistral OCR processing...');
+  
+  const base64Pdf = pdfBuffer.toString('base64');
+  
+  try {
+    const ocrResponse = await mistralClient.ocr.process({
+      model: "mistral-ocr-latest",
+      document: {
+        type: "document_base64",
+        document_base64: base64Pdf,
+      },
+      includeImageBase64: false,
+    });
 
-  const pdf = await loadingTask.promise;
-  const page = await pdf.getPage(pageNumber + 1);
-  
-  const textContent = await page.getTextContent();
-  const extractedText = textContent.items.map((item: any) => item.str || '').join(' ');
-  console.log(`Page ${pageNumber + 1} - PDF text layer: "${extractedText.substring(0, 200)}"`);
-  
-  if (extractedText && extractedText.length > 50) {
-    console.log(`Page ${pageNumber + 1} has ${extractedText.length} chars in text layer - using direct extraction`);
-  }
-  
-  const targetDPI = 380;
-  const baseDPI = 72;
-  const scale = targetDPI / baseDPI;
-  
-  const viewport = page.getViewport({ scale });
-  const maxImageSize = 25000000;
-  const actualSize = viewport.width * viewport.height;
-  const finalScale = actualSize > maxImageSize ? scale * Math.sqrt(maxImageSize / actualSize) : scale;
-  const finalViewport = page.getViewport({ scale: finalScale });
-  
-  const canvas = new Canvas(finalViewport.width, finalViewport.height);
-  const context = canvas.getContext("2d");
+    console.log(`Mistral OCR processed ${ocrResponse.pages?.length || 0} pages`);
+    
+    const pages = (ocrResponse.pages || []).map((page, index) => ({
+      markdown: page.markdown || "",
+      pageNumber: index + 1,
+    }));
 
-  await page.render({
-    canvasContext: context as any,
-    viewport: finalViewport,
-    canvas: canvas as any,
-  } as any).promise;
-
-  const rawImageData = canvas.toBuffer("image/png");
-  
-  console.log(`Page ${pageNumber + 1}: Rendered at ${Math.round(finalScale * baseDPI)} DPI (${finalViewport.width}x${finalViewport.height})`);
-  
-  console.log(`Testing OCR with raw image first...`);
-  const rawResult = await worker.recognize(rawImageData);
-  console.log(`Page ${pageNumber + 1} (RAW): ${rawResult.data.text.length} chars, ${rawResult.data.confidence?.toFixed(1) || 0}% confidence`);
-  
-  const results: Array<{ variant: string; result: any; confidence: number }> = [];
-  results.push({ variant: 'raw', result: rawResult, confidence: rawResult.data.confidence || 0 });
-  
-  for (const variant of ['grayscale', 'adaptive'] as const) {
-    const processedImage = await preprocessImageForOCR(rawImageData, variant);
-    
-    const result = await worker.recognize(processedImage);
-    
-    const avgConfidence = result.data.confidence || 0;
-    results.push({ variant, result, confidence: avgConfidence });
-    
-    console.log(`Page ${pageNumber + 1} (${variant}): ${result.data.text.length} chars, ${avgConfidence.toFixed(1)}% confidence`);
+    return {
+      pages,
+      totalPages: pages.length,
+    };
+  } catch (error) {
+    console.error('Mistral OCR error:', error);
+    throw new Error(`OCR processing failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
-  
-  results.sort((a, b) => b.confidence - a.confidence);
-  const bestResult = results[0].result;
-  
-  console.log(`Page ${pageNumber + 1}: Selected ${results[0].variant} variant (${results[0].confidence.toFixed(1)}% confidence)`);
-  
-  const words: OCRWord[] = bestResult.data.words?.map((w: any) => ({
-    text: w.text || '',
-    confidence: w.confidence || 0,
-    bbox: {
-      x0: w.bbox?.x0 || 0,
-      y0: w.bbox?.y0 || 0,
-      x1: w.bbox?.x1 || 0,
-      y1: w.bbox?.y1 || 0
-    }
-  })) || [];
-  
-  const lines: OCRLine[] = [];
-  if (words.length > 0) {
-    const sortedWords = [...words].sort((a, b) => a.bbox.y0 - b.bbox.y0);
-    let currentLine: OCRWord[] = [sortedWords[0]];
-    
-    for (let i = 1; i < sortedWords.length; i++) {
-      const word = sortedWords[i];
-      const prevWord = sortedWords[i - 1];
-      const yTolerance = 4;
-      
-      if (Math.abs(word.bbox.y0 - prevWord.bbox.y0) < yTolerance) {
-        currentLine.push(word);
-      } else {
-        if (currentLine.length > 0) {
-          const lineText = currentLine.map(w => w.text).join(' ');
-          const lineConfidence = currentLine.reduce((sum, w) => sum + w.confidence, 0) / currentLine.length;
-          const lineBbox = {
-            x0: Math.min(...currentLine.map(w => w.bbox.x0)),
-            y0: Math.min(...currentLine.map(w => w.bbox.y0)),
-            x1: Math.max(...currentLine.map(w => w.bbox.x1)),
-            y1: Math.max(...currentLine.map(w => w.bbox.y1))
-          };
-          lines.push({ text: lineText, confidence: lineConfidence, bbox: lineBbox, words: currentLine });
-        }
-        currentLine = [word];
-      }
-    }
-    
-    if (currentLine.length > 0) {
-      const lineText = currentLine.map(w => w.text).join(' ');
-      const lineConfidence = currentLine.reduce((sum, w) => sum + w.confidence, 0) / currentLine.length;
-      const lineBbox = {
-        x0: Math.min(...currentLine.map(w => w.bbox.x0)),
-        y0: Math.min(...currentLine.map(w => w.bbox.y0)),
-        x1: Math.max(...currentLine.map(w => w.bbox.x1)),
-        y1: Math.max(...currentLine.map(w => w.bbox.y1))
-      };
-      lines.push({ text: lineText, confidence: lineConfidence, bbox: lineBbox, words: currentLine });
-    }
-  }
-  
-  const originalPage = await pdf.getPage(pageNumber + 1);
-  const originalViewport = originalPage.getViewport({ scale: 1.0 });
-  
-  return {
-    text: bestResult.data.text.trim(),
-    confidence: results[0].confidence,
-    lines,
-    pageMetrics: {
-      viewportWidth: finalViewport.width,
-      viewportHeight: finalViewport.height,
-      pdfWidth: originalViewport.width,
-      pdfHeight: originalViewport.height,
-      scale: finalScale
-    }
-  };
 }
 
-async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer; extractedTexts: string[]; translatedTexts: string[] }> {
-  const loadingTask = pdfjsLib.getDocument({
-    data: new Uint8Array(pdfBuffer),
-    useSystemFonts: true,
-  });
-
-  const pdf = await loadingTask.promise;
-  const numPages = pdf.numPages;
+async function translatePdf(pdfBuffer: Buffer): Promise<{ 
+  translatedPdf: Buffer; 
+  extractedTexts: string[]; 
+  translatedTexts: string[] 
+}> {
+  console.log('Starting PDF translation process...');
   
-  console.log(`Processing PDF with ${numPages} pages`);
+  const ocrResult = await extractTextWithMistralOCR(pdfBuffer);
+  const numPages = ocrResult.totalPages;
   
-  console.log('Initializing Tesseract worker for Bengali/Assamese script...');
-  const worker = await createWorker('ben', 1, {
-    logger: (m) => {
-      console.log(`Tesseract: ${m.status} - ${m.progress ? Math.round(m.progress * 100) + '%' : ''}`);
-    }
-  });
+  console.log(`Processing ${numPages} pages`);
   
-  await worker.setParameters({
-    tessedit_char_blacklist: '',
-    lstm_choice_mode: '2',
-    preserve_interword_spaces: '1',
-    tessedit_write_images: '0'
-  });
-  console.log('Tesseract configured for Assamese script optimization');
-  
-  const ocrResults: OCRResult[] = [];
   const extractedTexts: string[] = [];
   const translatedTexts: string[] = [];
   
-  try {
-    for (let i = 0; i < numPages; i++) {
-      console.log(`Extracting text from page ${i + 1}/${numPages}`);
-      const ocrResult = await extractTextFromPdfPage(pdfBuffer, i, worker);
-      ocrResults.push(ocrResult);
-      extractedTexts.push(ocrResult.text);
+  for (let i = 0; i < ocrResult.pages.length; i++) {
+    const page = ocrResult.pages[i];
+    const pageText = page.markdown;
+    
+    extractedTexts.push(pageText);
+    
+    if (pageText && pageText.trim().length > 10) {
+      console.log(`Page ${i + 1}: ${pageText.length} chars extracted`);
+      console.log(`First 200 chars: ${pageText.substring(0, 200)}`);
       
-      if (ocrResult.text && ocrResult.text.length > 10) {
-        console.log(`Page ${i + 1}: ${ocrResult.lines.length} lines, ${ocrResult.text.length} chars, ${ocrResult.confidence.toFixed(1)}% confidence`);
-        console.log(`First 100 chars: ${ocrResult.text.substring(0, 100)}`);
+      try {
+        const cleanedText = pageText
+          .replace(/^#+\s*/gm, '')
+          .replace(/\*\*/g, '')
+          .replace(/\*/g, '')
+          .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')
+          .replace(/`/g, '')
+          .trim();
         
-        try {
-          const linesText = ocrResult.lines.map(line => line.text).join('\n');
-          const translated = await translateWithHuggingFace(linesText);
-          console.log(`Translation result: ${translated.substring(0, 100)}`);
-          translatedTexts.push(translated);
-        } catch (error) {
-          console.error(`Translation failed for page ${i + 1}:`, error);
-          translatedTexts.push(`[Translation failed: ${error}]`);
-        }
-      } else {
-        console.log(`Page ${i + 1} has insufficient text (${ocrResult.text.length} chars)`);
-        translatedTexts.push("");
+        const translated = await translateWithHuggingFace(cleanedText);
+        console.log(`Translation result: ${translated.substring(0, 200)}`);
+        translatedTexts.push(translated);
+      } catch (error) {
+        console.error(`Translation failed for page ${i + 1}:`, error);
+        translatedTexts.push(`[Translation failed: ${error}]`);
       }
+    } else {
+      console.log(`Page ${i + 1} has insufficient text (${pageText.length} chars)`);
+      translatedTexts.push("");
     }
-  } finally {
-    await worker.terminate();
-    console.log('Tesseract worker terminated');
   }
   
   const originalPdfDoc = await PDFDocument.load(pdfBuffer);
@@ -384,7 +218,12 @@ async function translatePdf(pdfBuffer: Buffer): Promise<{ translatedPdf: Buffer;
   };
 }
 
-const translationCache = new Map<string, { translatedPdf: Buffer; extractedTexts: string[]; translatedTexts: string[]; timestamp: number }>();
+const translationCache = new Map<string, { 
+  translatedPdf: Buffer; 
+  extractedTexts: string[]; 
+  translatedTexts: string[]; 
+  timestamp: number 
+}>();
 
 export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/translate", upload.single("file"), async (req, res) => {
