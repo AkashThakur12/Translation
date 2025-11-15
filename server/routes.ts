@@ -96,8 +96,8 @@ async function extractTextWithMistralOCR(pdfBuffer: Buffer): Promise<{
     const ocrResponse = await mistralClient.ocr.process({
       model: "mistral-ocr-latest",
       document: {
-        type: "document_url",
-        document_url: `data:application/pdf;base64,${base64Pdf}`,
+        type: "document_base64",
+        document_base64: base64Pdf,
       } as any,
       includeImageBase64: false,
     });
