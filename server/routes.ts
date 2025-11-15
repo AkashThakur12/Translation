@@ -29,7 +29,7 @@ async function translateWithHuggingFace(text: string): Promise<string> {
   return await pRetry(
     async () => {
       const response = await fetch(
-        "https://api-inference.huggingface.co/models/ai4bharat/indictrans2-indic-en-1B",
+        "https://router.huggingface.co/hf-inference/models/ai4bharat/indictrans2-indic-en-1B",
         {
           method: "POST",
           headers: {
@@ -90,21 +90,35 @@ async function extractTextWithMistralOCR(pdfBuffer: Buffer): Promise<{
 }> {
   console.log('Starting Mistral OCR processing...');
   
-  const base64Pdf = pdfBuffer.toString('base64');
-  
   try {
-    const ocrResponse = await mistralClient.ocr.process({
-      model: "mistral-ocr-latest",
-      document: {
-        type: "document_base64",
-        document_base64: base64Pdf,
-      } as any,
-      includeImageBase64: false,
+    const base64Pdf = pdfBuffer.toString('base64');
+    
+    console.log('Calling Mistral OCR REST API...');
+    const response = await fetch('https://api.mistral.ai/v1/ocr', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.MISTRAL_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'mistral-ocr-latest',
+        document: {
+          type: 'document_url',
+          document_url: `data:application/pdf;base64,${base64Pdf}`,
+        },
+        include_image_base64: false,
+      }),
     });
 
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Mistral API error: ${response.status} - ${errorText}`);
+    }
+
+    const ocrResponse = await response.json();
     console.log(`Mistral OCR processed ${ocrResponse.pages?.length || 0} pages`);
     
-    const pages = (ocrResponse.pages || []).map((page, index) => ({
+    const pages = (ocrResponse.pages || []).map((page: any, index: number) => ({
       markdown: page.markdown || "",
       pageNumber: index + 1,
     }));
