@@ -4,12 +4,14 @@ import multer from "multer";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
 import fetch from "node-fetch";
 import { Mistral } from "@mistralai/mistralai";
+import pLimit from "p-limit";
+import pRetry from "p-retry";
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-const mistralClient = new Mistral({
-  apiKey: process.env.MISTRAL_API_KEY || "",
-});
+let mistralClient: Mistral;
+
+const limit = pLimit(3);
 
 interface TranslationRequest {
   inputs: string;
@@ -24,41 +26,62 @@ async function translateWithHuggingFace(text: string): Promise<string> {
     return "";
   }
 
-  const response = await fetch(
-    "https://api-inference.huggingface.co/models/ai4bharat/indictrans2-indic-en-1B",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        inputs: text,
-        parameters: {
-          src_lang: "asm_Beng",
-          tgt_lang: "eng_Latn"
+  return await pRetry(
+    async () => {
+      const response = await fetch(
+        "https://api-inference.huggingface.co/models/ai4bharat/indictrans2-indic-en-1B",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            inputs: text,
+            parameters: {
+              src_lang: "asm_Beng",
+              tgt_lang: "eng_Latn"
+            }
+          } as TranslationRequest),
         }
-      } as TranslationRequest),
+      );
+
+      if (response.status === 429 || response.status >= 500) {
+        const errorText = await response.text();
+        throw new Error(`Retryable error: ${response.status} - ${errorText}`);
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("HuggingFace API error:", response.status, response.statusText, errorText);
+        const error: any = new Error(`Translation failed: ${response.status} - ${errorText}`);
+        error.name = 'AbortError';
+        throw error;
+      }
+
+      const result = await response.json();
+      
+      if (Array.isArray(result) && result.length > 0 && result[0]?.translation_text) {
+        return result[0].translation_text;
+      } else if (result && typeof result === 'object' && 'generated_text' in result && typeof result.generated_text === 'string') {
+        return result.generated_text;
+      } else if (typeof result === 'string') {
+        return result;
+      }
+      
+      console.error("Unexpected API response format:", result);
+      const formatError: any = new Error("Invalid translation response format");
+      formatError.name = 'AbortError';
+      throw formatError;
+    },
+    {
+      retries: 3,
+      minTimeout: 1000,
+      maxTimeout: 5000,
+      onFailedAttempt: (error) => {
+        console.log(`Translation attempt ${error.attemptNumber} failed. ${error.retriesLeft} retries left.`);
+      },
     }
   );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error("HuggingFace API error:", response.status, response.statusText, errorText);
-    throw new Error(`Translation failed: ${response.status} - ${errorText}`);
-  }
-
-  const result = await response.json();
-  
-  if (Array.isArray(result) && result.length > 0 && result[0]?.translation_text) {
-    return result[0].translation_text;
-  } else if (result && typeof result === 'object' && 'generated_text' in result && typeof result.generated_text === 'string') {
-    return result.generated_text;
-  } else if (typeof result === 'string') {
-    return result;
-  }
-  
-  console.error("Unexpected API response format:", result);
-  throw new Error("Invalid translation response format");
 }
 
 async function extractTextWithMistralOCR(pdfBuffer: Buffer): Promise<{
@@ -73,9 +96,9 @@ async function extractTextWithMistralOCR(pdfBuffer: Buffer): Promise<{
     const ocrResponse = await mistralClient.ocr.process({
       model: "mistral-ocr-latest",
       document: {
-        type: "document_base64",
-        document_base64: base64Pdf,
-      },
+        type: "document_url",
+        document_url: `data:application/pdf;base64,${base64Pdf}`,
+      } as any,
       includeImageBase64: false,
     });
 
@@ -110,18 +133,17 @@ async function translatePdf(pdfBuffer: Buffer): Promise<{
   
   const extractedTexts: string[] = [];
   const translatedTexts: string[] = [];
+  let failedPages = 0;
   
-  for (let i = 0; i < ocrResult.pages.length; i++) {
-    const page = ocrResult.pages[i];
-    const pageText = page.markdown;
-    
-    extractedTexts.push(pageText);
-    
-    if (pageText && pageText.trim().length > 10) {
-      console.log(`Page ${i + 1}: ${pageText.length} chars extracted`);
-      console.log(`First 200 chars: ${pageText.substring(0, 200)}`);
+  const translationPromises = ocrResult.pages.map((page, i) =>
+    limit(async () => {
+      const pageText = page.markdown;
+      extractedTexts[i] = pageText;
       
-      try {
+      if (pageText && pageText.trim().length > 10) {
+        console.log(`Page ${i + 1}: ${pageText.length} chars extracted`);
+        console.log(`First 200 chars: ${pageText.substring(0, 200)}`);
+        
         const cleanedText = pageText
           .replace(/^#+\s*/gm, '')
           .replace(/\*\*/g, '')
@@ -130,17 +152,27 @@ async function translatePdf(pdfBuffer: Buffer): Promise<{
           .replace(/`/g, '')
           .trim();
         
-        const translated = await translateWithHuggingFace(cleanedText);
-        console.log(`Translation result: ${translated.substring(0, 200)}`);
-        translatedTexts.push(translated);
-      } catch (error) {
-        console.error(`Translation failed for page ${i + 1}:`, error);
-        translatedTexts.push(`[Translation failed: ${error}]`);
+        try {
+          const translated = await translateWithHuggingFace(cleanedText);
+          console.log(`Page ${i + 1} translation complete: ${translated.substring(0, 200)}`);
+          return translated;
+        } catch (error) {
+          failedPages++;
+          console.error(`Translation failed for page ${i + 1}:`, error);
+          throw error;
+        }
+      } else {
+        console.log(`Page ${i + 1} has insufficient text (${pageText.length} chars)`);
+        return "";
       }
-    } else {
-      console.log(`Page ${i + 1} has insufficient text (${pageText.length} chars)`);
-      translatedTexts.push("");
-    }
+    })
+  );
+  
+  try {
+    const results = await Promise.all(translationPromises);
+    translatedTexts.push(...results);
+  } catch (error) {
+    throw new Error(`Translation failed for ${failedPages} page(s): ${error instanceof Error ? error.message : 'Unknown error'}`);
   }
   
   const originalPdfDoc = await PDFDocument.load(pdfBuffer);
@@ -226,6 +258,14 @@ const translationCache = new Map<string, {
 }>();
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  if (!process.env.MISTRAL_API_KEY) {
+    throw new Error("MISTRAL_API_KEY environment variable is required");
+  }
+  
+  mistralClient = new Mistral({
+    apiKey: process.env.MISTRAL_API_KEY,
+  });
+  
   app.post("/api/translate", upload.single("file"), async (req, res) => {
     try {
       if (!req.file) {
